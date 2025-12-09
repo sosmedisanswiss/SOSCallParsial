@@ -1,13 +1,14 @@
-﻿using System.Net;
-using System.Net.Sockets;
-using System.Text;
-using Microsoft.Extensions.Hosting;
+﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using SOSCallParsial.DAL;
 using SOSCallParsial.DAL.Entities;
 using SOSCallParsial.Models;
 using SOSCallParsial.Models.Configs;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 
 namespace SOSCallParsial.Services
 {
@@ -33,48 +34,57 @@ namespace SOSCallParsial.Services
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            var listener = new TcpListener(IPAddress.Any, _tcpSettings.Port);
-
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                listener.Start();
-                _logger.LogInformation("✅ TCP Listener started on port {Port}", _tcpSettings.Port);
+                var listener = new TcpListener(IPAddress.Any, _tcpSettings.Port);
 
-                while (!stoppingToken.IsCancellationRequested)
+                try
                 {
-                    try
-                    {
-                        _logger.LogDebug("🟡 Waiting for new TCP client...");
-                        var client = await listener.AcceptTcpClientAsync(stoppingToken);
-                        _logger.LogInformation("🔌 New TCP client connected.");
+                    listener.Start();
+                    _logger.LogInformation("✅ TCP Listener started on port {Port}", _tcpSettings.Port);
 
-                        _ = Task.Run(() => HandleClientAsync(client, stoppingToken), stoppingToken);
-                    }
-                    catch (OperationCanceledException)
+                    while (!stoppingToken.IsCancellationRequested)
                     {
-                        _logger.LogWarning("🔴 AcceptTcpClientAsync canceled.");
-                        break;
-                    }
-                    catch (SocketException sex)
-                    {
-                        _logger.LogError(sex, "❌ SocketException while accepting client.");
-                        await Task.Delay(1000, stoppingToken); // дати трохи часу
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "❌ Unexpected exception in TCP listener.");
-                        await Task.Delay(1000, stoppingToken);
+                        try
+                        {
+                            _logger.LogDebug("🟡 Waiting for new TCP client...");
+                            var client = await listener.AcceptTcpClientAsync(stoppingToken);
+                            _logger.LogInformation("🔌 New TCP client connected.");
+
+                            _ = HandleClientAsync(client, stoppingToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            _logger.LogWarning("🔴 AcceptTcpClientAsync canceled.");
+                            break;
+                        }
+                        catch (SocketException sex)
+                        {
+                            _logger.LogError(sex, "❌ SocketException while accepting client.");
+                            await Task.Delay(1000, stoppingToken); // дати трохи часу
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "❌ Unexpected exception in TCP listener.");
+                            await Task.Delay(1000, stoppingToken);
+                        }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogCritical(ex, "🚨 Fatal error starting TCP listener.");
-            }
-            finally
-            {
-                listener.Stop();
-                _logger.LogInformation("🛑 TCP Listener stopped.");
+                catch (Exception ex)
+                {
+                    _logger.LogCritical(ex, "🚨 Fatal error starting TCP listener. Restarting...");
+                }
+                finally
+                {
+                    listener.Stop();
+                    _logger.LogInformation("🛑 TCP Listener stopped.");
+                }
+
+                if (!stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation("🔄 Restarting TCP listener after failure or shutdown.");
+                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                }
             }
         }
 
@@ -91,38 +101,36 @@ namespace SOSCallParsial.Services
                 return;
             }
 
+            client.NoDelay = true;
+            client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+
             using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.ASCII);
 
             try
             {
                 while (!cancellationToken.IsCancellationRequested && client.Connected)
                 {
-                    //Console.WriteLine("📥 Waiting for message...");
+                    var raw = await ReadUntilCR(stream, cancellationToken);
 
-                    if (stream.DataAvailable && stream.ReadByte() != 0x0A)
+                    if (raw is null)
                     {
-                        _logger.LogWarning("Message did not start with LF (0x0A)");
+                        _logger.LogInformation("Client disconnected while waiting for data.");
+                        break;
                     }
 
-                    var raw = await ReadUntilCR(reader, cancellationToken);
-
+ 
                     if (string.IsNullOrWhiteSpace(raw)) continue;
 
-                    Console.WriteLine($"📨 Raw message received: {raw}");
-                    _logger.LogInformation("Received raw message: {Raw}", raw);
+                     _logger.LogInformation("Received raw message: {Raw}", raw);
 
                     var parsed = _parser.Parse(raw);
                     if (parsed == null)
                     {
-                        Console.WriteLine("❗ Message could not be parsed.");
-                        _logger.LogWarning("Message could not be parsed: {Raw}", raw);
+                         _logger.LogWarning("Message could not be parsed: {Raw}", raw);
                         continue;
                     }
 
-                    Console.WriteLine("✅ Message parsed successfully.");
-                    Console.WriteLine($"📞 Phone: {parsed.PhoneNumber} | Code: {parsed.EventCode}");
-
+ 
                     using var scope = _serviceProvider.CreateScope();
                     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                     var callService = scope.ServiceProvider.GetRequiredService<CallQueueService>();
@@ -139,8 +147,7 @@ namespace SOSCallParsial.Services
                     });
 
                     await db.SaveChangesAsync(cancellationToken);
-                    Console.WriteLine("💾 Saved message to database.");
-
+ 
                     await callService.EnqueueCallAsync(parsed);
                     await stream.WriteAsync(Encoding.ASCII.GetBytes("ACK\r"), cancellationToken);
                     _logger.LogInformation("ACK sent back to client.");
@@ -148,39 +155,66 @@ namespace SOSCallParsial.Services
             }
             catch (Exception ex)
             {
-                Console.WriteLine("❌ Error while processing TCP client:");
-                Console.WriteLine(ex.ToString());
-                _logger.LogError(ex, "Error handling TCP client");
+                 _logger.LogError(ex, "Error handling TCP client");
             }
             finally
             {
                 client.Close();
-                Console.WriteLine("🔒 TCP connection closed.");
-            }
+             }
         }
 
-        private async Task<string> ReadUntilCR(StreamReader reader, CancellationToken token)
+        private async Task<string?> ReadUntilCR(NetworkStream stream, CancellationToken token)
         {
-            var sb = new StringBuilder();
-            char[] buffer = new char[1];
+            var messageBytes = new List<byte>(256);
+            var buffer = new byte[1];
+            var expectingLeadLf = true;
 
             try
             {
                 while (!token.IsCancellationRequested)
                 {
-                    int read = await reader.ReadAsync(buffer, 0, 1);
-                    if (read == 0) break;
+                    int read = await stream.ReadAsync(buffer.AsMemory(0, 1), token);
+                    if (read == 0)
+                    {
+                        return null; // connection closed
+                    }
 
-                    if (buffer[0] == '\r') break;
-                    sb.Append(buffer[0]);
+                    byte current = buffer[0];
+
+                    if (expectingLeadLf)
+                    {
+                        if (current != 0x0A)
+                        {
+                            _logger.LogWarning("Message did not start with LF (0x0A)");
+                        }
+                        else
+                        {
+                            expectingLeadLf = false;
+                            continue; // skip the expected LF
+                        }
+
+                        expectingLeadLf = false;
+                    }
+
+                    if (current == 0x0D) break;
+                    messageBytes.Add(current);
                 }
             }
             catch (IOException ex)
             {
                 _logger.LogWarning(ex, "⚠️ Connection closed unexpectedly during read.");
             }
+            catch (OperationCanceledException)
+            {
+                return null;
+            }
 
-            return sb.ToString();
+            if (token.IsCancellationRequested)
+            {
+                return null;
+            }
+
+            return Encoding.ASCII.GetString(messageBytes.ToArray());
         }
     }
 }
