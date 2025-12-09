@@ -57,10 +57,19 @@ namespace SOSCallParsial.Services
 
                 _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 
+                var phone = message.PhoneNumber?.Trim() ?? "";
+
+                 if (phone.StartsWith("+41"))
+                {
+                    phone = "0" + phone.Substring(3); 
+                }
+
                 var callPayload = new
                 {
-                    destination = "+" + message.PhoneNumber
+                    destination = phone
                 };
+
+
 
                 string json = JsonSerializer.Serialize(callPayload);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
