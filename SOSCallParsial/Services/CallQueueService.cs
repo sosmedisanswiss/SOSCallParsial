@@ -59,7 +59,7 @@ namespace SOSCallParsial.Services
 
                 var callPayload = new
                 {
-                    destination = message.PhoneNumber
+                    destination = "+" + message.PhoneNumber
                 };
 
                 string json = JsonSerializer.Serialize(callPayload);
