@@ -14,6 +14,8 @@ namespace SOSCallParsial.Services
 {
     public class TcpListenerService : BackgroundService
     {
+        private static readonly byte[] AckPayload = Encoding.ASCII.GetBytes("ACK\r");
+
         private readonly ILogger<TcpListenerService> _logger;
         private readonly DomoMessageParser _parser;
         private readonly IServiceProvider _serviceProvider;
@@ -51,7 +53,7 @@ namespace SOSCallParsial.Services
                             var client = await listener.AcceptTcpClientAsync(stoppingToken);
                             _logger.LogInformation("🔌 New TCP client connected.");
 
-                            _ = HandleClientAsync(client, stoppingToken);
+                            _ = Task.Run(() => HandleClientAsync(client, stoppingToken));
                         }
                         catch (OperationCanceledException)
                         {
@@ -90,11 +92,27 @@ namespace SOSCallParsial.Services
 
         private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
         {
-            var remoteIp = ((IPEndPoint)client.Client.RemoteEndPoint).Address;
+            var remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
+            if (remoteEndPoint is null)
+            {
+                _logger.LogWarning("TCP client connected without a remote endpoint.");
+                client.Close();
+                return;
+            }
+
+            var remoteIp = remoteEndPoint.Address;
             _logger.LogInformation("Incoming connection from IP: {IP}", remoteIp);
 
+            IPAddress? allowedIp = null;
             if (!string.IsNullOrWhiteSpace(_tcpSettings.AllowedIp) &&
-                !remoteIp.Equals(IPAddress.Parse(_tcpSettings.AllowedIp)))
+                !IPAddress.TryParse(_tcpSettings.AllowedIp, out allowedIp))
+            {
+                _logger.LogError("Configured AllowedIp '{AllowedIp}' is not a valid IP address.", _tcpSettings.AllowedIp);
+                client.Close();
+                return;
+            }
+
+            if (allowedIp is not null && !remoteIp.Equals(allowedIp))
             {
                 _logger.LogWarning("Connection from unauthorized IP: {IP}", remoteIp);
                 client.Close();
@@ -147,10 +165,10 @@ namespace SOSCallParsial.Services
                     });
 
                     await db.SaveChangesAsync(cancellationToken);
- 
-                    await callService.EnqueueCallAsync(parsed);
-                    await stream.WriteAsync(Encoding.ASCII.GetBytes("ACK\r"), cancellationToken);
+                    await stream.WriteAsync(AckPayload, cancellationToken);
                     _logger.LogInformation("ACK sent back to client.");
+
+                    await callService.EnqueueCallAsync(parsed);
                 }
             }
             catch (Exception ex)
