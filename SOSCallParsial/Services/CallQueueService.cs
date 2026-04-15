@@ -53,7 +53,13 @@ namespace SOSCallParsial.Services
                 }
 
                 using var tokenDoc = JsonDocument.Parse(tokenJson);
-                string accessToken = tokenDoc.RootElement.GetProperty("access_token").GetString();
+                var accessToken = tokenDoc.RootElement.GetProperty("access_token").GetString();
+
+                if (string.IsNullOrWhiteSpace(accessToken))
+                {
+                    _logger.LogError("Token response does not contain a valid access_token.");
+                    return;
+                }
 
                 _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
 

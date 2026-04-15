@@ -19,6 +19,7 @@ namespace SOSCallParsial.Services
         private readonly ILogger<TcpListenerService> _logger;
         private readonly DomoMessageParser _parser;
         private readonly IServiceProvider _serviceProvider;
+        private readonly TcpServerStatus _serverStatus;
         private readonly TcpSettings _tcpSettings;
 
 
@@ -26,11 +27,13 @@ namespace SOSCallParsial.Services
             ILogger<TcpListenerService> logger,
             DomoMessageParser parser,
             IServiceProvider serviceProvider,
+            TcpServerStatus serverStatus,
             IOptions<TcpSettings> tcpOptions)
         {
             _logger = logger;
             _parser = parser;
             _serviceProvider = serviceProvider;
+            _serverStatus = serverStatus;
             _tcpSettings = tcpOptions.Value;
         }
 
@@ -43,6 +46,7 @@ namespace SOSCallParsial.Services
                 try
                 {
                     listener.Start();
+                    _serverStatus.MarkListenerStarted(_tcpSettings.Host, _tcpSettings.Port, _tcpSettings.AllowedIp);
                     _logger.LogInformation("✅ TCP Listener started on port {Port}", _tcpSettings.Port);
 
                     while (!stoppingToken.IsCancellationRequested)
@@ -62,11 +66,13 @@ namespace SOSCallParsial.Services
                         }
                         catch (SocketException sex)
                         {
+                            _serverStatus.MarkError($"SocketException while accepting client: {sex.Message}");
                             _logger.LogError(sex, "❌ SocketException while accepting client.");
                             await Task.Delay(1000, stoppingToken); // дати трохи часу
                         }
                         catch (Exception ex)
                         {
+                            _serverStatus.MarkError($"Unexpected exception in TCP listener: {ex.Message}");
                             _logger.LogError(ex, "❌ Unexpected exception in TCP listener.");
                             await Task.Delay(1000, stoppingToken);
                         }
@@ -74,11 +80,13 @@ namespace SOSCallParsial.Services
                 }
                 catch (Exception ex)
                 {
+                    _serverStatus.MarkError($"Fatal error starting TCP listener: {ex.Message}");
                     _logger.LogCritical(ex, "🚨 Fatal error starting TCP listener. Restarting...");
                 }
                 finally
                 {
                     listener.Stop();
+                    _serverStatus.MarkListenerStopped();
                     _logger.LogInformation("🛑 TCP Listener stopped.");
                 }
 
@@ -101,19 +109,31 @@ namespace SOSCallParsial.Services
             }
 
             var remoteIp = remoteEndPoint.Address;
-            _logger.LogInformation("Incoming connection from IP: {IP}", remoteIp);
+            var isInternalHealthProbe = IPAddress.IsLoopback(remoteIp);
+            var remoteIpText = remoteIp.ToString();
+
+            if (isInternalHealthProbe)
+            {
+                _logger.LogDebug("Internal health probe connected from IP: {IP}", remoteIp);
+            }
+            else
+            {
+                _logger.LogInformation("Incoming connection from IP: {IP}", remoteIp);
+            }
 
             IPAddress? allowedIp = null;
             if (!string.IsNullOrWhiteSpace(_tcpSettings.AllowedIp) &&
                 !IPAddress.TryParse(_tcpSettings.AllowedIp, out allowedIp))
             {
+                _serverStatus.MarkError($"Configured AllowedIp '{_tcpSettings.AllowedIp}' is not a valid IP address.");
                 _logger.LogError("Configured AllowedIp '{AllowedIp}' is not a valid IP address.", _tcpSettings.AllowedIp);
                 client.Close();
                 return;
             }
 
-            if (allowedIp is not null && !remoteIp.Equals(allowedIp))
+            if (allowedIp is not null && !remoteIp.Equals(allowedIp) && !isInternalHealthProbe)
             {
+                _serverStatus.MarkUnauthorizedConnection(remoteIpText);
                 _logger.LogWarning("Connection from unauthorized IP: {IP}", remoteIp);
                 client.Close();
                 return;
@@ -123,23 +143,42 @@ namespace SOSCallParsial.Services
             client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
 
             using var stream = client.GetStream();
+            var isTrackedClient = false;
 
             try
             {
+                if (!isInternalHealthProbe)
+                {
+                    _serverStatus.MarkClientConnected(remoteIpText);
+                    isTrackedClient = true;
+                }
+
                 while (!cancellationToken.IsCancellationRequested && client.Connected)
                 {
                     var raw = await ReadUntilCR(stream, cancellationToken);
 
                     if (raw is null)
                     {
-                        _logger.LogInformation("Client disconnected while waiting for data.");
+                        if (isInternalHealthProbe)
+                        {
+                            _logger.LogDebug("Internal health probe disconnected.");
+                        }
+                        else
+                        {
+                            _logger.LogInformation("Client disconnected while waiting for data.");
+                        }
                         break;
                     }
 
  
                     if (string.IsNullOrWhiteSpace(raw)) continue;
 
-                     _logger.LogInformation("Received raw message: {Raw}", raw);
+                    if (!isInternalHealthProbe)
+                    {
+                        _serverStatus.MarkMessageReceived(raw);
+                    }
+
+                    _logger.LogInformation("Received raw message: {Raw}", raw);
 
                     var parsed = _parser.Parse(raw);
                     if (parsed == null)
@@ -173,12 +212,18 @@ namespace SOSCallParsial.Services
             }
             catch (Exception ex)
             {
-                 _logger.LogError(ex, "Error handling TCP client");
+                _serverStatus.MarkError($"Error handling TCP client {remoteIpText}: {ex.Message}");
+                _logger.LogError(ex, "Error handling TCP client");
             }
             finally
             {
+                if (isTrackedClient)
+                {
+                    _serverStatus.MarkClientDisconnected();
+                }
+
                 client.Close();
-             }
+            }
         }
 
         private async Task<string?> ReadUntilCR(NetworkStream stream, CancellationToken token)
