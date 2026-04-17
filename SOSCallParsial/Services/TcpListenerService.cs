@@ -9,12 +9,19 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace SOSCallParsial.Services
 {
     public class TcpListenerService : BackgroundService
     {
-        private static readonly byte[] AckPayload = Encoding.ASCII.GetBytes("ACK\r");
+        private static readonly Regex AckSequenceRegex = new(
+            @"""[^""]+""(?<Seq>\d{4})",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+        private static readonly Regex AckAccountRegex = new(
+            @"L[0-9A-Za-z]{1,6}#(?<Acct>[^\[]+)\[",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
         private readonly ILogger<TcpListenerService> _logger;
         private readonly DomoMessageParser _parser;
@@ -187,6 +194,12 @@ namespace SOSCallParsial.Services
                         continue;
                     }
 
+                    if (!TryExtractAckContext(raw, parsed.Account, out var seq, out var account))
+                    {
+                        _logger.LogWarning("Unable to extract ACK context from message: {Raw}", raw);
+                        continue;
+                    }
+
  
                     using var scope = _serviceProvider.CreateScope();
                     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -204,8 +217,9 @@ namespace SOSCallParsial.Services
                     });
 
                     await db.SaveChangesAsync(cancellationToken);
-                    await stream.WriteAsync(AckPayload, cancellationToken);
-                    _logger.LogInformation("ACK sent back to client.");
+                    var ackPayload = BuildAckDc09(seq, account);
+                    await stream.WriteAsync(ackPayload, cancellationToken);
+                    _logger.LogInformation("DC-09 ACK sent back to client for seq {Seq} and account {Account}.", seq, account);
 
                     await callService.EnqueueCallAsync(parsed);
                 }
@@ -278,6 +292,63 @@ namespace SOSCallParsial.Services
             }
 
             return Encoding.ASCII.GetString(messageBytes.ToArray());
+        }
+
+        private static bool TryExtractAckContext(string rawMessage, string fallbackAccount, out string seq, out string account)
+        {
+            seq = string.Empty;
+            account = string.Empty;
+
+            var seqMatch = AckSequenceRegex.Match(rawMessage);
+            if (!seqMatch.Success)
+            {
+                return false;
+            }
+
+            seq = seqMatch.Groups["Seq"].Value;
+
+            var accountMatch = AckAccountRegex.Match(rawMessage);
+            account = accountMatch.Success
+                ? accountMatch.Groups["Acct"].Value
+                : fallbackAccount;
+
+            return !string.IsNullOrWhiteSpace(account);
+        }
+
+        private static byte[] BuildAckDc09(string seq, string account)
+        {
+            var payload = $"\"ACK\"{seq}L0#{account}[]";
+            var payloadBytes = Encoding.ASCII.GetBytes(payload);
+            var crc = CalculateDc07Crc(payloadBytes);
+            var length = $"0{payloadBytes.Length:X3}";
+            var frame = $"\n{crc:X4}{length}{payload}\r";
+
+            return Encoding.ASCII.GetBytes(frame);
+        }
+
+        private static ushort CalculateDc07Crc(ReadOnlySpan<byte> payloadBytes)
+        {
+            ushort crc = 0;
+
+            foreach (var currentByte in payloadBytes)
+            {
+                var temp = (int)currentByte;
+
+                for (var i = 0; i < 8; i++)
+                {
+                    temp ^= crc & 0x0001;
+                    crc >>= 1;
+
+                    if ((temp & 0x0001) != 0)
+                    {
+                        crc ^= 0xA001;
+                    }
+
+                    temp >>= 1;
+                }
+            }
+
+            return crc;
         }
     }
 }
